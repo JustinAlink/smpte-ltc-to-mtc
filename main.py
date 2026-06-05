@@ -12,12 +12,18 @@ CHANNELS = 1
 RATE = 48000
 CHUNK = 2048
 SYNC_WORD = '0011111111111101'
+# Upper bound on accumulated bits between sync words; prevents unbounded
+# growth when the input is noise. Comfortably larger than one 80-bit frame.
+MAX_BIT_BUFFER = 200
 
 jam = '00:00:00:00'
 _tc_lock = threading.Lock()
 _audio_instance: 'pyaudio.PyAudio | None' = None
 _audio_stream = None
 _midi_port = None
+
+# Maps microphone display name -> PyAudio device index. Populated by main().
+microphone_indices: 'dict[str, int]' = {}
 
 
 def bin_to_bytes(a: str, size: int = 1) -> bytes:
@@ -64,6 +70,63 @@ def decode_frame(frame: str) -> dict:
     return o
 
 
+class LTCDecoder:
+    """Stateful biphase-mark LTC decoder.
+
+    State (the partial bit buffer and the phase-tracking variables) is kept
+    between calls to ``feed`` so that LTC bits and frames straddling audio
+    chunk boundaries are decoded correctly rather than dropped.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        self.output: list[str] = []
+        self.last = None
+        self.toggle = True
+        self.sp = 1
+
+    def feed(self, wave_frames: bytes) -> list[str]:
+        """Decode a chunk of 16-bit mono audio, returning any completed
+        timecode strings (usually zero or one)."""
+        results: list[str] = []
+        for i in range(0, len(wave_frames), 2):
+            data = wave_frames[i:i + 2]
+            cyc = 'Neg' if audioop.minmax(data, 2)[0] < 0 else 'Pos'
+
+            if cyc != self.last:
+                if self.sp >= 7:
+                    if self.sp > 14:
+                        bit = '0'
+                    elif self.toggle:
+                        bit = '1'
+                    else:
+                        bit = ''
+
+                    if bit:
+                        self.output.append(bit)
+                    self.toggle = not self.toggle if self.sp <= 14 else True
+
+                    if len(self.output) >= len(SYNC_WORD):
+                        tail = ''.join(self.output[-len(SYNC_WORD):])
+                        if tail == SYNC_WORD and len(self.output) >= 80:
+                            frame_data = ''.join(self.output[-80:])
+                            self.output.clear()
+                            results.append(decode_frame(frame_data)['formatted_tc'])
+                        elif len(self.output) > MAX_BIT_BUFFER:
+                            # Drop the oldest bits to bound memory on noisy input.
+                            del self.output[:-MAX_BIT_BUFFER]
+                self.sp = 1
+            else:
+                self.sp += 1
+            self.last = cyc
+        return results
+
+
+_decoder = LTCDecoder()
+
+
 def print_tc() -> None:
     freq = str_frequency_to_int(selected_frequency.get())
     inter = 1 / freq
@@ -103,43 +166,8 @@ def print_tc() -> None:
             h += 1
 
 
-def decode_ltc(wave_frames: bytes) -> None:
-    global jam
-
-    output: list[str] = []
-    last, toggle, sp = None, True, 1
-
-    for i in range(0, len(wave_frames), 2):
-        data = wave_frames[i:i + 2]
-        cyc = 'Neg' if audioop.minmax(data, 2)[0] < 0 else 'Pos'
-
-        if cyc != last:
-            if sp >= 7:
-                if sp > 14:
-                    bit = '0'
-                elif toggle:
-                    bit = '1'
-                else:
-                    bit = ''
-
-                if bit:
-                    output.append(bit)
-                toggle = not toggle if sp <= 14 else True
-
-                if len(output) >= len(SYNC_WORD):
-                    tail = ''.join(output[-len(SYNC_WORD):])
-                    if tail == SYNC_WORD and len(output) >= 80:
-                        frame_data = ''.join(output[-80:])
-                        output.clear()
-                        with _tc_lock:
-                            jam = decode_frame(frame_data)['formatted_tc']
-            sp = 1
-        else:
-            sp += 1
-        last = cyc
-
-
 def loop_decode_ltc(stream) -> None:
+    global jam
     if not enable_listening.get():
         return
     try:
@@ -148,7 +176,9 @@ def loop_decode_ltc(stream) -> None:
         return
     volume_db = get_volume_db(data)
     label_volume.config(text=f"Volume: {round(volume_db)} dB")
-    decode_ltc(data)
+    for tc in _decoder.feed(data):
+        with _tc_lock:
+            jam = tc
     if enable_listening.get():
         frame.after(10, lambda: loop_decode_ltc(stream))
 
@@ -186,6 +216,7 @@ def init_ltc_listener() -> None:
 
     _close_audio()
     _close_midi()
+    _decoder.reset()
 
     midi_port_name = selected_midi.get()
     if midi_port_name:
@@ -193,6 +224,10 @@ def init_ltc_listener() -> None:
             _midi_port = mido.open_output(midi_port_name)
         except Exception as e:
             print(f"Failed to open MIDI port: {e}")
+
+    # Resolve the selected microphone name back to its PyAudio device index.
+    # None falls back to the system default input device.
+    device_index = microphone_indices.get(selected_microphone.get())
 
     _audio_instance = pyaudio.PyAudio()
     t = threading.Thread(target=print_tc, daemon=True)
@@ -204,7 +239,7 @@ def init_ltc_listener() -> None:
         rate=RATE,
         input=True,
         frames_per_buffer=CHUNK,
-        input_device_index=selected_microphone_index.get(),
+        input_device_index=device_index,
     )
     loop_decode_ltc(_audio_stream)
 
@@ -269,7 +304,9 @@ def get_default_input_device_name() -> str:
     return default_name
 
 
-def get_available_microphones() -> list[str]:
+def get_available_microphones() -> 'list[tuple[str, int]]':
+    """Return (name, device_index) pairs for every input-capable device,
+    with the system default device first."""
     p = pyaudio.PyAudio()
     info = p.get_host_api_info_by_index(0)
     num_devices = info.get('deviceCount')
@@ -278,13 +315,14 @@ def get_available_microphones() -> list[str]:
     for i in range(num_devices):
         device_info = p.get_device_info_by_index(i)
         if device_info.get('maxInputChannels') > 0:
-            microphones.append(device_info['name'])
+            microphones.append((device_info['name'], i))
     p.terminate()
 
     default_name = get_default_input_device_name()
-    if default_name in microphones:
-        microphones.remove(default_name)
-        microphones.insert(0, default_name)
+    for idx, (name, _) in enumerate(microphones):
+        if name == default_name:
+            microphones.insert(0, microphones.pop(idx))
+            break
 
     return microphones
 
@@ -337,60 +375,72 @@ def toggle_read_ltc() -> None:
         _close_midi()
 
 
-# Defines values from lists
-microphones_options = get_available_microphones() or ["(no microphone)"]
-frequencies_options = ["24 Hz", "25 Hz", "30 Hz"]
-midis_options = get_available_midis() or ["(no MIDI output)"]
+def main() -> None:
+    global microphone_indices
+    global frame, selected_microphone, selected_frequency, selected_midi
+    global enable_listening, status_color, status_square
+    global label_microphone, label_frequency, label_midi
+    global toggle_button, label_timecode, label_volume
 
-# Create main frame
-frame = tk.Tk()
-frame.title("SMPTE LTC to MTC 1.1.0")
-frame.geometry("300x450")
-frame.resizable(width=False, height=False)
+    # Defines values from lists
+    mic_list = get_available_microphones()
+    microphone_indices = {name: index for name, index in mic_list}
+    microphones_options = [name for name, _ in mic_list] or ["(no microphone)"]
+    frequencies_options = ["24 Hz", "25 Hz", "30 Hz"]
+    midis_options = get_available_midis() or ["(no MIDI output)"]
 
-# Define variables from tk
-selected_microphone = tk.StringVar(value=microphones_options[0])
-selected_frequency = tk.StringVar(value=frequencies_options[0])
-selected_midi = tk.StringVar(value=midis_options[0])
-selected_microphone_index = tk.IntVar(value=0)
-enable_listening = tk.BooleanVar(value=False)
-status_color = tk.StringVar(value="Red")
+    # Create main frame
+    frame = tk.Tk()
+    frame.title("SMPTE LTC to MTC 1.1.0")
+    frame.geometry("300x450")
+    frame.resizable(width=False, height=False)
 
-# Configure grid to center elements
-for i in range(12):
-    frame.grid_rowconfigure(i, weight=1)
-    frame.grid_columnconfigure(i, weight=1)
+    # Define variables from tk
+    selected_microphone = tk.StringVar(value=microphones_options[0])
+    selected_frequency = tk.StringVar(value=frequencies_options[0])
+    selected_midi = tk.StringVar(value=midis_options[0])
+    enable_listening = tk.BooleanVar(value=False)
+    status_color = tk.StringVar(value="Red")
 
-# Draw status square
-status_square = tk.Canvas(frame, width=50, height=50, bg="red")
-status_square.grid(row=0, column=4, pady=10, sticky="n")
+    # Configure grid to center elements
+    for i in range(12):
+        frame.grid_rowconfigure(i, weight=1)
+        frame.grid_columnconfigure(i, weight=1)
 
-# Draw microphone selector
-tk.Label(frame, text="Select microphone", font=("Helvetica", 10, "bold")).grid(row=1, column=4, pady=5, sticky="n")
-label_microphone = tk.OptionMenu(frame, selected_microphone, *microphones_options)
-label_microphone.grid(row=2, column=4, pady=5, sticky="n")
+    # Draw status square
+    status_square = tk.Canvas(frame, width=50, height=50, bg="red")
+    status_square.grid(row=0, column=4, pady=10, sticky="n")
 
-# Draw frequency selector
-tk.Label(frame, text="Select frequency", font=("Helvetica", 10, "bold")).grid(row=3, column=4, pady=5, sticky="n")
-label_frequency = tk.OptionMenu(frame, selected_frequency, *frequencies_options)
-label_frequency.grid(row=4, column=4, pady=5, sticky="n")
+    # Draw microphone selector
+    tk.Label(frame, text="Select microphone", font=("Helvetica", 10, "bold")).grid(row=1, column=4, pady=5, sticky="n")
+    label_microphone = tk.OptionMenu(frame, selected_microphone, *microphones_options)
+    label_microphone.grid(row=2, column=4, pady=5, sticky="n")
 
-# Draw MIDI output selector
-tk.Label(frame, text="Select MIDI output", font=("Helvetica", 10, "bold")).grid(row=6, column=4, pady=5, sticky="n")
-label_midi = tk.OptionMenu(frame, selected_midi, *midis_options)
-label_midi.grid(row=7, column=4, pady=5, sticky="n")
+    # Draw frequency selector
+    tk.Label(frame, text="Select frequency", font=("Helvetica", 10, "bold")).grid(row=3, column=4, pady=5, sticky="n")
+    label_frequency = tk.OptionMenu(frame, selected_frequency, *frequencies_options)
+    label_frequency.grid(row=4, column=4, pady=5, sticky="n")
 
-# Draw toggle button
-toggle_button = tk.Button(frame, text="Enable listener", command=toggle_read_ltc)
-toggle_button.grid(row=8, column=4, pady=10, sticky="n")
+    # Draw MIDI output selector
+    tk.Label(frame, text="Select MIDI output", font=("Helvetica", 10, "bold")).grid(row=6, column=4, pady=5, sticky="n")
+    label_midi = tk.OptionMenu(frame, selected_midi, *midis_options)
+    label_midi.grid(row=7, column=4, pady=5, sticky="n")
 
-# Draw timecode
-label_timecode = tk.Label(frame, text="Timecode", font=("Helvetica", 10, "bold"))
-label_timecode.grid(row=9, column=4, pady=10, sticky="n")
+    # Draw toggle button
+    toggle_button = tk.Button(frame, text="Enable listener", command=toggle_read_ltc)
+    toggle_button.grid(row=8, column=4, pady=10, sticky="n")
 
-# Draw volume
-label_volume = tk.Label(frame, text="Volume", font=("Helvetica", 10, "bold"))
-label_volume.grid(row=11, column=4, pady=10, sticky="n")
+    # Draw timecode
+    label_timecode = tk.Label(frame, text="Timecode", font=("Helvetica", 10, "bold"))
+    label_timecode.grid(row=9, column=4, pady=10, sticky="n")
 
-# Starting main loop
-frame.mainloop()
+    # Draw volume
+    label_volume = tk.Label(frame, text="Volume", font=("Helvetica", 10, "bold"))
+    label_volume.grid(row=11, column=4, pady=10, sticky="n")
+
+    # Starting main loop
+    frame.mainloop()
+
+
+if __name__ == "__main__":
+    main()
