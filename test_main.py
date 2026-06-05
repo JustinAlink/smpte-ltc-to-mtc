@@ -157,6 +157,23 @@ class TestDecoderThresholds(unittest.TestCase):
         self.assertAlmostEqual(dec.zero_threshold, 17.5)
 
 
+class TestGetVolumeDb(unittest.TestCase):
+    def test_silence_returns_neg_inf(self):
+        self.assertEqual(main.get_volume_db(b'\x00\x00' * 100), float('-inf'))
+
+    def test_empty_returns_neg_inf(self):
+        self.assertEqual(main.get_volume_db(b''), float('-inf'))
+
+    def test_known_signal(self):
+        # 1000 LSB 16-bit samples: RMS = 1000, dB = 20*log10(1000) = 60.0
+        data = b'\xe8\x03' * 200  # 0x03E8 = 1000 in little-endian s16
+        self.assertAlmostEqual(main.get_volume_db(data), 60.0, places=5)
+
+    def test_no_audioop_dependency(self):
+        import importlib
+        self.assertNotIn('audioop', dir(main))
+
+
 class TestLTCDecoder(unittest.TestCase):
     def test_reset_clears_state(self):
         dec = main.LTCDecoder()

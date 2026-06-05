@@ -1,5 +1,5 @@
+import struct
 import pyaudio
-import audioop
 import math
 import time
 import threading
@@ -22,12 +22,17 @@ MAX_BIT_BUFFER = 200
 MIN_GATE_FACTOR = 0.35
 ZERO_THRESHOLD_FACTOR = 0.70
 
+# Seconds without a decoded LTC frame before the indicator shows "no signal".
+NO_SIGNAL_TIMEOUT = 2.0
+
 jam = '00:00:00:00'
 drop_frame_mode = False
 _tc_lock = threading.Lock()
 _audio_instance: 'pyaudio.PyAudio | None' = None
 _audio_stream = None
 _midi_port = None
+_stop_event = threading.Event()
+_last_frame_time: float = 0.0
 
 # Maps microphone display name -> PyAudio device index. Populated by main().
 microphone_indices: 'dict[str, int]' = {}
@@ -107,9 +112,11 @@ class LTCDecoder:
         """Decode a chunk of 16-bit mono audio, returning any completed
         timecode strings (usually zero or one)."""
         results: list[str] = []
-        for i in range(0, len(wave_frames), 2):
-            data = wave_frames[i:i + 2]
-            cyc = 'Neg' if audioop.minmax(data, 2)[0] < 0 else 'Pos'
+        n_samples = len(wave_frames) // 2
+        samples = struct.unpack_from(f'<{n_samples}h', wave_frames)
+
+        for sample in samples:
+            cyc = 'Neg' if sample < 0 else 'Pos'
 
             if cyc != self.last:
                 if self.sp >= self.min_gate:
@@ -209,6 +216,8 @@ def print_tc() -> None:
     (eight messages span two frames, encoding one complete timecode). The
     cadence is locked to a monotonic clock so it does not drift, and the
     internal counter is continually re-synced to the latest decoded LTC value.
+    All Tkinter widget updates are dispatched to the main thread via
+    frame.after() so this thread never touches the UI directly.
     """
     freq = str_frequency_to_int(selected_frequency.get())
     if freq == 0:
@@ -225,9 +234,9 @@ def print_tc() -> None:
     qf_values: 'list[tuple[int, int]] | None' = None
     next_t = time.monotonic()
 
-    while enable_listening.get():
-        # At the start of each eight-message cycle, re-sync to the decoded LTC
-        # and latch the timecode that this cycle will transmit.
+    while not _stop_event.is_set():
+        # At the start of each eight-message cycle, re-sync to the decoded LTC,
+        # evaluate signal state, and latch the timecode for this cycle.
         if qf_index == 0:
             with _tc_lock:
                 current_jam = jam
@@ -237,14 +246,19 @@ def print_tc() -> None:
                 last_jam = current_jam
 
             tcp = "{:02d}:{:02d}:{:02d}:{:02d}".format(h, m, s, f)
-            if compare_timestamps(tcp, current_jam, freq) < 1.5:
+            no_signal = (time.monotonic() - _last_frame_time) > NO_SIGNAL_TIMEOUT
+
+            if no_signal:
+                qf_values = None
+                frame.after(0, lambda: status_square.configure(bg='grey'))
+            elif compare_timestamps(tcp, current_jam, freq) < 1.5:
                 qf_values = mtc_quarter_frame_values(h, m, s, f, freq)
-                label_timecode.config(text=f"Timecode : {tcp}")
-                status_color.set("green")
+                _tcp = tcp
+                frame.after(0, lambda t=_tcp: label_timecode.config(text=f"Timecode : {t}"))
+                frame.after(0, lambda: status_square.configure(bg='green'))
             else:
                 qf_values = None
-                status_color.set("orange")
-            status_square.configure(bg=status_color.get())
+                frame.after(0, lambda: status_square.configure(bg='orange'))
 
         if qf_values is not None:
             _send_quarter_frame(*qf_values[qf_index])
@@ -257,28 +271,42 @@ def print_tc() -> None:
 
         next_t += qf_interval
         delay = next_t - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
-        elif delay < -qf_interval:
+        if _stop_event.wait(timeout=max(0.0, delay)):
+            break
+        if delay < -qf_interval:
             # Fell more than one interval behind; rebase to avoid a burst.
             next_t = time.monotonic()
 
 
+def _update_volume_bar(db: float) -> None:
+    """Redraw the volume meter canvas. Called from the main thread only."""
+    volume_canvas.delete('bar')
+    w = volume_canvas.winfo_width()
+    if w < 2:
+        return
+    if db <= -60.0 or db == float('-inf'):
+        return
+    frac = max(0.0, min(1.0, (db - (-60.0)) / 60.0))
+    bar_px = max(1, int(w * frac))
+    color = '#ff4444' if db > -3 else '#ffcc00' if db > -12 else '#44cc44'
+    volume_canvas.create_rectangle(0, 0, bar_px, 16, fill=color, outline='', tags='bar')
+
+
 def loop_decode_ltc(stream) -> None:
-    global jam, drop_frame_mode
+    global jam, drop_frame_mode, _last_frame_time
     if not enable_listening.get():
         return
     try:
         data = stream.read(CHUNK, exception_on_overflow=False)
     except Exception:
         return
-    volume_db = get_volume_db(data)
-    label_volume.config(text=f"Volume: {round(volume_db)} dB")
+    _update_volume_bar(get_volume_db(data))
     results = _decoder.feed(data)
     if results:
         with _tc_lock:
             jam = results[-1]
             drop_frame_mode = _decoder.drop_frame
+        _last_frame_time = time.monotonic()
     if enable_listening.get():
         frame.after(10, lambda: loop_decode_ltc(stream))
 
@@ -312,10 +340,12 @@ def _close_midi() -> None:
 
 
 def init_ltc_listener() -> None:
-    global _audio_instance, _audio_stream, _midi_port
+    global _audio_instance, _audio_stream, _midi_port, _last_frame_time
 
     _close_audio()
     _close_midi()
+    _stop_event.clear()
+    _last_frame_time = 0.0
 
     freq = str_frequency_to_int(selected_frequency.get())
     if freq:
@@ -408,31 +438,32 @@ def str_frequency_to_int(s: str) -> int:
         return 0
 
 
-def get_volume_db(data: bytes, sample_width: int = 2) -> float:
-    try:
-        rms = audioop.rms(data, sample_width)
-        if rms > 0:
-            return 20 * math.log10(rms)
+def get_volume_db(data: bytes) -> float:
+    n = len(data) // 2
+    if n == 0:
         return float('-inf')
-    except Exception as e:
-        print(f"Erreur lors du calcul du volume : {e}")
+    samples = struct.unpack_from(f'<{n}h', data)
+    mean_sq = sum(s * s for s in samples) / n
+    if mean_sq == 0:
         return float('-inf')
+    return 20 * math.log10(math.sqrt(mean_sq))
 
 
 def toggle_read_ltc() -> None:
     enable_listening.set(not enable_listening.get())
 
     if enable_listening.get():
-        status_color.set("Orange")
-        status_square.configure(bg=status_color.get())
+        # Grey until the first LTC frame arrives.
+        status_square.configure(bg='grey')
         toggle_button.configure(text="Disable listener")
         label_microphone.configure(state="disabled")
         label_frequency.configure(state="disabled")
         label_midi.configure(state="disabled")
         init_ltc_listener()
     else:
-        status_color.set("Red")
-        status_square.configure(bg=status_color.get())
+        _stop_event.set()
+        status_square.configure(bg='red')
+        volume_canvas.delete('bar')
         toggle_button.configure(text="Enable listener")
         label_microphone.configure(state="normal")
         label_frequency.configure(state="normal")
@@ -444,9 +475,9 @@ def toggle_read_ltc() -> None:
 def main() -> None:
     global microphone_indices
     global frame, selected_microphone, selected_frequency, selected_midi
-    global enable_listening, status_color, status_square
+    global enable_listening, status_square
     global label_microphone, label_frequency, label_midi
-    global toggle_button, label_timecode, label_volume
+    global toggle_button, label_timecode, volume_canvas
 
     # Defines values from lists
     mic_list = get_available_microphones()
@@ -458,7 +489,7 @@ def main() -> None:
     # Create main frame
     frame = tk.Tk()
     frame.title("SMPTE LTC to MTC 1.1.0")
-    frame.geometry("300x450")
+    frame.geometry("300x480")
     frame.resizable(width=False, height=False)
 
     # Define variables from tk
@@ -466,45 +497,46 @@ def main() -> None:
     selected_frequency = tk.StringVar(value=frequencies_options[0])
     selected_midi = tk.StringVar(value=midis_options[0])
     enable_listening = tk.BooleanVar(value=False)
-    status_color = tk.StringVar(value="Red")
 
     # Configure grid to center elements
-    for i in range(12):
+    for i in range(13):
         frame.grid_rowconfigure(i, weight=1)
+    for i in range(12):
         frame.grid_columnconfigure(i, weight=1)
 
-    # Draw status square
-    status_square = tk.Canvas(frame, width=50, height=50, bg="red")
+    # Status indicator: red=stopped, grey=no signal, orange=out of sync, green=locked
+    status_square = tk.Canvas(frame, width=50, height=50, bg='red', highlightthickness=0)
     status_square.grid(row=0, column=4, pady=10, sticky="n")
 
-    # Draw microphone selector
+    # Microphone selector
     tk.Label(frame, text="Select microphone", font=("Helvetica", 10, "bold")).grid(row=1, column=4, pady=5, sticky="n")
     label_microphone = tk.OptionMenu(frame, selected_microphone, *microphones_options)
     label_microphone.grid(row=2, column=4, pady=5, sticky="n")
 
-    # Draw frequency selector
+    # Frequency selector
     tk.Label(frame, text="Select frequency", font=("Helvetica", 10, "bold")).grid(row=3, column=4, pady=5, sticky="n")
     label_frequency = tk.OptionMenu(frame, selected_frequency, *frequencies_options)
     label_frequency.grid(row=4, column=4, pady=5, sticky="n")
 
-    # Draw MIDI output selector
+    # MIDI output selector
     tk.Label(frame, text="Select MIDI output", font=("Helvetica", 10, "bold")).grid(row=6, column=4, pady=5, sticky="n")
     label_midi = tk.OptionMenu(frame, selected_midi, *midis_options)
     label_midi.grid(row=7, column=4, pady=5, sticky="n")
 
-    # Draw toggle button
+    # Toggle button
     toggle_button = tk.Button(frame, text="Enable listener", command=toggle_read_ltc)
     toggle_button.grid(row=8, column=4, pady=10, sticky="n")
 
-    # Draw timecode
+    # Timecode display
     label_timecode = tk.Label(frame, text="Timecode", font=("Helvetica", 10, "bold"))
     label_timecode.grid(row=9, column=4, pady=10, sticky="n")
 
-    # Draw volume
-    label_volume = tk.Label(frame, text="Volume", font=("Helvetica", 10, "bold"))
-    label_volume.grid(row=11, column=4, pady=10, sticky="n")
+    # Input level label + volume meter canvas
+    tk.Label(frame, text="Input Level", font=("Helvetica", 9)).grid(
+        row=10, column=0, columnspan=12, padx=20, sticky="w")
+    volume_canvas = tk.Canvas(frame, height=16, bg='#2b2b2b', highlightthickness=0)
+    volume_canvas.grid(row=11, column=0, columnspan=12, padx=20, pady=(0, 8), sticky="ew")
 
-    # Starting main loop
     frame.mainloop()
 
 
