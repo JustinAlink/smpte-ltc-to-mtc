@@ -101,6 +101,62 @@ class TestStrFrequencyToInt(unittest.TestCase):
         self.assertEqual(main.str_frequency_to_int('bogus'), 0)
 
 
+class TestAdvanceTimecode(unittest.TestCase):
+    def test_simple_increment(self):
+        self.assertEqual(main.advance_timecode(0, 0, 0, 0, 1, 30), (0, 0, 0, 1))
+
+    def test_frame_rollover(self):
+        self.assertEqual(main.advance_timecode(0, 0, 0, 29, 1, 30), (0, 0, 1, 0))
+        self.assertEqual(main.advance_timecode(0, 0, 0, 23, 1, 24), (0, 0, 1, 0))
+
+    def test_minute_and_hour_rollover(self):
+        self.assertEqual(main.advance_timecode(0, 0, 59, 29, 1, 30), (0, 1, 0, 0))
+        self.assertEqual(main.advance_timecode(0, 59, 59, 29, 1, 30), (1, 0, 0, 0))
+
+    def test_day_wraps_at_24h(self):
+        self.assertEqual(main.advance_timecode(23, 59, 59, 29, 1, 30), (0, 0, 0, 0))
+
+    def test_add_multiple_frames(self):
+        self.assertEqual(main.advance_timecode(0, 0, 0, 28, 2, 30), (0, 0, 1, 0))
+
+    def test_drop_frame_skips_at_minute_boundary(self):
+        # Entering a non-multiple-of-ten minute skips frames 00 and 01.
+        self.assertEqual(main.advance_timecode(0, 0, 59, 29, 1, 30, True), (0, 1, 0, 2))
+
+    def test_drop_frame_no_skip_on_tenth_minute(self):
+        self.assertEqual(main.advance_timecode(0, 9, 59, 29, 1, 30, True), (0, 10, 0, 0))
+
+    def test_drop_frame_ignored_when_not_30fps(self):
+        self.assertEqual(main.advance_timecode(0, 0, 59, 24, 1, 25, True), (0, 1, 0, 0))
+
+
+class TestMtcQuarterFrameValues(unittest.TestCase):
+    def test_eight_ordered_pairs(self):
+        vals = main.mtc_quarter_frame_values(1, 2, 3, 4, 30)
+        self.assertEqual(len(vals), 8)
+        self.assertEqual([t for t, _ in vals], list(range(8)))
+
+    def test_type7_encodes_rate_and_hour_tens(self):
+        # 23h -> hour tens nibble = 1; 30 fps -> rate code 2.
+        vals = main.mtc_quarter_frame_values(23, 0, 0, 0, 30)
+        self.assertEqual(vals[7], (7, (2 << 1) | 1))
+        # Single-digit hour -> hour tens 0; 24 fps -> rate code 0.
+        vals = main.mtc_quarter_frame_values(5, 0, 0, 0, 24)
+        self.assertEqual(vals[7], (7, (0 << 1) | 0))
+
+
+class TestDecoderThresholds(unittest.TestCase):
+    def test_thresholds_match_legacy_at_30fps(self):
+        dec = main.LTCDecoder(rate=48000, fps=30)
+        self.assertAlmostEqual(dec.min_gate, 7.0)
+        self.assertAlmostEqual(dec.zero_threshold, 14.0)
+
+    def test_thresholds_scale_with_fps(self):
+        dec = main.LTCDecoder(rate=48000, fps=24)
+        self.assertAlmostEqual(dec.min_gate, 8.75)
+        self.assertAlmostEqual(dec.zero_threshold, 17.5)
+
+
 class TestLTCDecoder(unittest.TestCase):
     def test_reset_clears_state(self):
         dec = main.LTCDecoder()

@@ -16,7 +16,14 @@ SYNC_WORD = '0011111111111101'
 # growth when the input is noise. Comfortably larger than one 80-bit frame.
 MAX_BIT_BUFFER = 200
 
+# Biphase-mark detection thresholds, expressed as fractions of the samples
+# per bit (= RATE / (80 * fps)). At 48 kHz / 30 fps the samples-per-bit is 20,
+# so these reproduce the original hand-tuned constants of 7 and 14.
+MIN_GATE_FACTOR = 0.35
+ZERO_THRESHOLD_FACTOR = 0.70
+
 jam = '00:00:00:00'
+drop_frame_mode = False
 _tc_lock = threading.Lock()
 _audio_instance: 'pyaudio.PyAudio | None' = None
 _audio_stream = None
@@ -75,17 +82,26 @@ class LTCDecoder:
 
     State (the partial bit buffer and the phase-tracking variables) is kept
     between calls to ``feed`` so that LTC bits and frames straddling audio
-    chunk boundaries are decoded correctly rather than dropped.
+    chunk boundaries are decoded correctly rather than dropped. The detection
+    thresholds are derived from the sample rate and frame rate so decoding is
+    robust at 24/25 fps, not just 30.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, rate: int = RATE, fps: int = 30) -> None:
+        self.configure(rate, fps)
         self.reset()
+
+    def configure(self, rate: int, fps: int) -> None:
+        samples_per_bit = rate / (80 * fps)
+        self.min_gate = samples_per_bit * MIN_GATE_FACTOR
+        self.zero_threshold = samples_per_bit * ZERO_THRESHOLD_FACTOR
 
     def reset(self) -> None:
         self.output: list[str] = []
         self.last = None
         self.toggle = True
         self.sp = 1
+        self.drop_frame = False
 
     def feed(self, wave_frames: bytes) -> list[str]:
         """Decode a chunk of 16-bit mono audio, returning any completed
@@ -96,8 +112,8 @@ class LTCDecoder:
             cyc = 'Neg' if audioop.minmax(data, 2)[0] < 0 else 'Pos'
 
             if cyc != self.last:
-                if self.sp >= 7:
-                    if self.sp > 14:
+                if self.sp >= self.min_gate:
+                    if self.sp > self.zero_threshold:
                         bit = '0'
                     elif self.toggle:
                         bit = '1'
@@ -106,14 +122,16 @@ class LTCDecoder:
 
                     if bit:
                         self.output.append(bit)
-                    self.toggle = not self.toggle if self.sp <= 14 else True
+                    self.toggle = not self.toggle if self.sp <= self.zero_threshold else True
 
                     if len(self.output) >= len(SYNC_WORD):
                         tail = ''.join(self.output[-len(SYNC_WORD):])
                         if tail == SYNC_WORD and len(self.output) >= 80:
                             frame_data = ''.join(self.output[-80:])
                             self.output.clear()
-                            results.append(decode_frame(frame_data)['formatted_tc'])
+                            decoded = decode_frame(frame_data)
+                            self.drop_frame = bool(decoded['drop_frame'])
+                            results.append(decoded['formatted_tc'])
                         elif len(self.output) > MAX_BIT_BUFFER:
                             # Drop the oldest bits to bound memory on noisy input.
                             del self.output[:-MAX_BIT_BUFFER]
@@ -127,47 +145,127 @@ class LTCDecoder:
 _decoder = LTCDecoder()
 
 
-def print_tc() -> None:
-    freq = str_frequency_to_int(selected_frequency.get())
-    inter = 1 / freq
+def advance_timecode(h: int, m: int, s: int, f: int, frames_to_add: int,
+                     fps: int, drop_frame: bool = False) -> 'tuple[int, int, int, int]':
+    """Advance a timecode by ``frames_to_add`` frames, rolling over fields and
+    applying SMPTE drop-frame compensation when requested.
 
-    with _tc_lock:
-        current_jam = jam
-    h, m, s, f = [int(x) for x in current_jam.split(':')]
-    last_jam = current_jam
-
-    while enable_listening.get():
-        with _tc_lock:
-            current_jam = jam
-
-        if current_jam != last_jam:
-            h, m, s, f = [int(x) for x in current_jam.split(':')]
-            last_jam = current_jam
-
-        tcp = "{:02d}:{:02d}:{:02d}:{:02d}".format(h, m, s, f)
-
-        if compare_timestamps(tcp, current_jam, freq) < 1.5:
-            send_mtc_signal(tcp)
-            status_color.set("green")
-        else:
-            status_color.set("orange")
-        status_square.configure(bg=status_color.get())
-
-        time.sleep(inter)
+    Drop-frame (29.97 fps, signalled by the LTC drop-frame flag and carried at
+    a nominal 30 fps) skips frame numbers 00 and 01 at the top of every minute
+    except minutes that are multiples of ten.
+    """
+    for _ in range(frames_to_add):
         f += 1
-        if f >= freq:
+        if f >= fps:
             f = 0
             s += 1
         if s >= 60:
             s = 0
             m += 1
+            if drop_frame and fps == 30 and (m % 10) != 0:
+                f = 2
         if m >= 60:
             m = 0
             h += 1
+        if h >= 24:
+            h = 0
+    return h, m, s, f
+
+
+def mtc_quarter_frame_values(hours: int, minutes: int, seconds: int,
+                             frames: int, fps: int) -> 'list[tuple[int, int]]':
+    """Return the eight MTC quarter-frame (frame_type, frame_value) pairs that
+    encode a single timecode, in transmission order (types 0..7)."""
+    mtc_hours = decimal_to_hex_pair(hours)
+    mtc_minutes = decimal_to_hex_pair(minutes)
+    mtc_seconds = decimal_to_hex_pair(seconds)
+    mtc_frames = decimal_to_hex_pair(frames)
+    rate = {24: 0, 25: 1, 30: 2}.get(fps, 2)
+    return [
+        (0, mtc_frames[1]),
+        (1, mtc_frames[0]),
+        (2, mtc_seconds[1]),
+        (3, mtc_seconds[0]),
+        (4, mtc_minutes[1]),
+        (5, mtc_minutes[0]),
+        (6, mtc_hours[1]),
+        (7, (rate << 1) | mtc_hours[0]),
+    ]
+
+
+def _send_quarter_frame(frame_type: int, frame_value: int) -> None:
+    if _midi_port is None:
+        return
+    try:
+        _midi_port.send(mido.Message('quarter_frame', frame_type=frame_type, frame_value=frame_value))
+    except Exception as e:
+        print(f"MIDI send error: {e}")
+
+
+def print_tc() -> None:
+    """Free-running MTC transmitter.
+
+    Emits MIDI quarter-frame messages at the spec rate of four per frame
+    (eight messages span two frames, encoding one complete timecode). The
+    cadence is locked to a monotonic clock so it does not drift, and the
+    internal counter is continually re-synced to the latest decoded LTC value.
+    """
+    freq = str_frequency_to_int(selected_frequency.get())
+    if freq == 0:
+        return
+    qf_interval = 1.0 / (4 * freq)
+
+    with _tc_lock:
+        current_jam = jam
+        df = drop_frame_mode
+    h, m, s, f = [int(x) for x in current_jam.split(':')]
+    last_jam = current_jam
+
+    qf_index = 0
+    qf_values: 'list[tuple[int, int]] | None' = None
+    next_t = time.monotonic()
+
+    while enable_listening.get():
+        # At the start of each eight-message cycle, re-sync to the decoded LTC
+        # and latch the timecode that this cycle will transmit.
+        if qf_index == 0:
+            with _tc_lock:
+                current_jam = jam
+                df = drop_frame_mode
+            if current_jam != last_jam:
+                h, m, s, f = [int(x) for x in current_jam.split(':')]
+                last_jam = current_jam
+
+            tcp = "{:02d}:{:02d}:{:02d}:{:02d}".format(h, m, s, f)
+            if compare_timestamps(tcp, current_jam, freq) < 1.5:
+                qf_values = mtc_quarter_frame_values(h, m, s, f, freq)
+                label_timecode.config(text=f"Timecode : {tcp}")
+                status_color.set("green")
+            else:
+                qf_values = None
+                status_color.set("orange")
+            status_square.configure(bg=status_color.get())
+
+        if qf_values is not None:
+            _send_quarter_frame(*qf_values[qf_index])
+
+        qf_index += 1
+        if qf_index >= 8:
+            qf_index = 0
+            # Eight quarter-frames have elapsed: two frames of real time.
+            h, m, s, f = advance_timecode(h, m, s, f, 2, freq, df)
+
+        next_t += qf_interval
+        delay = next_t - time.monotonic()
+        if delay > 0:
+            time.sleep(delay)
+        elif delay < -qf_interval:
+            # Fell more than one interval behind; rebase to avoid a burst.
+            next_t = time.monotonic()
 
 
 def loop_decode_ltc(stream) -> None:
-    global jam
+    global jam, drop_frame_mode
     if not enable_listening.get():
         return
     try:
@@ -176,9 +274,11 @@ def loop_decode_ltc(stream) -> None:
         return
     volume_db = get_volume_db(data)
     label_volume.config(text=f"Volume: {round(volume_db)} dB")
-    for tc in _decoder.feed(data):
+    results = _decoder.feed(data)
+    if results:
         with _tc_lock:
-            jam = tc
+            jam = results[-1]
+            drop_frame_mode = _decoder.drop_frame
     if enable_listening.get():
         frame.after(10, lambda: loop_decode_ltc(stream))
 
@@ -216,6 +316,10 @@ def init_ltc_listener() -> None:
 
     _close_audio()
     _close_midi()
+
+    freq = str_frequency_to_int(selected_frequency.get())
+    if freq:
+        _decoder.configure(RATE, freq)
     _decoder.reset()
 
     midi_port_name = selected_midi.get()
@@ -242,44 +346,6 @@ def init_ltc_listener() -> None:
         input_device_index=device_index,
     )
     loop_decode_ltc(_audio_stream)
-
-
-def send_mtc_signal(timecode_str: str) -> None:
-    if _midi_port is None:
-        return
-
-    frequency = str_frequency_to_int(selected_frequency.get())
-    if frequency == 0:
-        return
-
-    try:
-        hours, minutes, seconds, frames = map(int, timecode_str.split(':'))
-    except (ValueError, IndexError):
-        raise ValueError("Invalid timecode format. Use HH:MM:SS:FF format.")
-
-    if not 0 <= hours < 24 or not 0 <= minutes < 60 or not 0 <= seconds < 60 or not 0 <= frames < frequency:
-        raise ValueError("Invalid timecode values.")
-
-    label_timecode.config(text=f"Timecode : {timecode_str}")
-
-    mtc_hours = decimal_to_hex_pair(hours)
-    mtc_minutes = decimal_to_hex_pair(minutes)
-    mtc_seconds = decimal_to_hex_pair(seconds)
-    mtc_frames = decimal_to_hex_pair(frames)
-
-    mtc_frequency = {24: 0, 25: 1, 30: 2}.get(frequency, 2)
-
-    try:
-        _midi_port.send(mido.Message('quarter_frame', frame_type=0, frame_value=mtc_frames[1]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=1, frame_value=mtc_frames[0]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=2, frame_value=mtc_seconds[1]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=3, frame_value=mtc_seconds[0]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=4, frame_value=mtc_minutes[1]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=5, frame_value=mtc_minutes[0]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=6, frame_value=mtc_hours[1]))
-        _midi_port.send(mido.Message('quarter_frame', frame_type=7, frame_value=(mtc_frequency << 1) | mtc_hours[0]))
-    except Exception as e:
-        print(f"MIDI send error: {e}")
 
 
 def decimal_to_hex_pair(decimal_value: int) -> list[int]:
