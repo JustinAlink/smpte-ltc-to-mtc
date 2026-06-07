@@ -29,9 +29,26 @@ to a MIDI output port.
 > may need to be installed via your system package manager.
 
 ## Installation
+
+**macOS / Linux:**
 ```bash
 pip install -r requirements.txt
 ```
+
+**Windows:**
+```
+pip install -r requirements.txt
+```
+If PyAudio fails to install on Windows (PortAudio not found), use the
+pre-built wheel via pipwin:
+```
+pip install pipwin
+pipwin install pyaudio
+pip install mido python-rtmidi
+```
+
+If you see a *"Missing dependency"* dialog when launching, run the
+appropriate install command above and try again.
 
 ## How to Use
 Run the application:

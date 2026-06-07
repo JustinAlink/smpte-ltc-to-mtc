@@ -1,11 +1,43 @@
 import struct
-import pyaudio
 import math
 import time
 import threading
-import mido
-import mido.backends.rtmidi
 import tkinter as tk
+
+def _missing(pkg: str, extra: str = '') -> None:
+    """Show a friendly dialog (or console message) then exit."""
+    msg = (
+        f"Missing dependency: {pkg}\n\n"
+        f"Run this in your terminal / command prompt:\n"
+        f"    pip install -r requirements.txt\n"
+    )
+    if extra:
+        msg += f"\n{extra}"
+    try:
+        import tkinter.messagebox as mb
+        _root = tk.Tk()
+        _root.withdraw()
+        mb.showerror("SMPTE LTC to MTC — setup required", msg)
+        _root.destroy()
+    except Exception:
+        print(msg)
+    raise SystemExit(1)
+
+try:
+    import pyaudio
+except ImportError:
+    _missing(
+        "PyAudio",
+        "On Windows, if pip install fails:\n"
+        "  pip install pipwin\n"
+        "  pipwin install pyaudio",
+    )
+
+try:
+    import mido
+    import mido.backends.rtmidi  # noqa: F401
+except ImportError:
+    _missing("mido / python-rtmidi")
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
