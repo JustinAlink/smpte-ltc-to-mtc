@@ -1,0 +1,63 @@
+name: Build Windows executable
+
+# Produces a standalone SMPTE-LTC-to-MTC.exe that runs without Python
+# installed. Run it manually from the Actions tab, or publish a release
+# and the .exe is attached to it automatically.
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # 3.11 has prebuilt wheels for PyAudio and python-rtmidi on Windows,
+          # which avoids needing a C compiler on the runner.
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+          python -m pip install pyinstaller
+
+      - name: Run tests
+        run: python -m unittest test_main -v
+
+      - name: Build executable
+        run: >
+          pyinstaller
+          --onefile
+          --windowed
+          --name SMPTE-LTC-to-MTC
+          --hidden-import mido.backends.rtmidi
+          main.py
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SMPTE-LTC-to-MTC-windows
+          path: dist/SMPTE-LTC-to-MTC.exe
+          if-no-files-found: error
+
+      - name: Attach executable to release
+        if: github.event_name == 'release' || startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release upload
+          ${{ github.event.release.tag_name || github.ref_name }}
+          dist/SMPTE-LTC-to-MTC.exe
+          --clobber
