@@ -42,8 +42,16 @@ except ImportError:
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 48000
-CHUNK = 2048
+# 512 frames = ~10.7 ms of audio at 48 kHz. Capture runs on its own thread, so
+# a small chunk costs nothing in UI smoothness and cuts the delay between a
+# timecode arriving and it being decoded to roughly a quarter of a 2048 chunk.
+CHUNK = 512
 SYNC_WORD = '0011111111111101'
+# Same 16 bits as an integer, for O(1) sync detection via a rolling register.
+SYNC_INT = int(SYNC_WORD, 2)
+SYNC_MASK = (1 << len(SYNC_WORD)) - 1
+# How often the UI redraws itself from shared state, in milliseconds.
+UI_REFRESH_MS = 50
 # Upper bound on accumulated bits between sync words; prevents unbounded
 # growth when the input is noise. Comfortably larger than one 80-bit frame.
 MAX_BIT_BUFFER = 200
@@ -65,7 +73,19 @@ _audio_stream = None
 _midi_port = None
 _stop_event = threading.Event()
 _tc_thread: 'threading.Thread | None' = None
+_audio_thread: 'threading.Thread | None' = None
 _last_frame_time: float = 0.0
+
+# Published by the worker threads, consumed by ui_refresh() on the main thread.
+# Plain assignments of immutable values, so no lock is needed to read them.
+_volume_db: float = float('-inf')
+_status_state: str = 'grey'
+_display_tc: str = '--:--:--:--'
+
+# What ui_refresh() last painted, so unchanged values cost nothing.
+_shown_status: 'str | None' = None
+_shown_tc: 'str | None' = None
+_shown_volume: 'int | None' = None
 
 # Maps microphone display name -> PyAudio device index. Populated by main().
 microphone_indices: 'dict[str, int]' = {}
@@ -136,49 +156,74 @@ class LTCDecoder:
 
     def reset(self) -> None:
         self.output: list[str] = []
-        self.last = None
+        self.last = False
         self.toggle = True
         self.sp = 1
+        self.sync_reg = 0
         self.drop_frame = False
 
     def feed(self, wave_frames: bytes) -> list[str]:
         """Decode a chunk of 16-bit mono audio, returning any completed
-        timecode strings (usually zero or one)."""
+        timecode strings (usually zero or one).
+
+        This runs once per input sample (48000 times a second), so the loop
+        keeps its state in locals rather than on ``self`` and detects the sync
+        word with a rolling 16-bit register instead of slicing and joining the
+        bit buffer on every bit.
+        """
         results: list[str] = []
         n_samples = len(wave_frames) // 2
-        samples = struct.unpack_from(f'<{n_samples}h', wave_frames)
+        if n_samples == 0:
+            return results
 
-        for sample in samples:
-            cyc = 'Neg' if sample < 0 else 'Pos'
+        # Hoist to locals: attribute lookups dominate a loop this hot.
+        output = self.output
+        last = self.last
+        toggle = self.toggle
+        sp = self.sp
+        sync_reg = self.sync_reg
+        min_gate = self.min_gate
+        zero_threshold = self.zero_threshold
+        append = output.append
 
-            if cyc != self.last:
-                if self.sp >= self.min_gate:
-                    if self.sp > self.zero_threshold:
+        for sample in struct.unpack_from(f'<{n_samples}h', wave_frames):
+            neg = sample < 0
+
+            if neg != last:
+                if sp >= min_gate:
+                    if sp > zero_threshold:
                         bit = '0'
-                    elif self.toggle:
+                        toggle = True
+                    elif toggle:
                         bit = '1'
+                        toggle = False
                     else:
                         bit = ''
+                        toggle = True
 
                     if bit:
-                        self.output.append(bit)
-                    self.toggle = not self.toggle if self.sp <= self.zero_threshold else True
+                        append(bit)
+                        sync_reg = ((sync_reg << 1) | (bit == '1')) & SYNC_MASK
 
-                    if len(self.output) >= len(SYNC_WORD):
-                        tail = ''.join(self.output[-len(SYNC_WORD):])
-                        if tail == SYNC_WORD and len(self.output) >= 80:
-                            frame_data = ''.join(self.output[-80:])
-                            self.output.clear()
+                        if sync_reg == SYNC_INT and len(output) >= 80:
+                            frame_data = ''.join(output[-80:])
+                            del output[:]
+                            sync_reg = 0
                             decoded = decode_frame(frame_data)
                             self.drop_frame = bool(decoded['drop_frame'])
                             results.append(decoded['formatted_tc'])
-                        elif len(self.output) > MAX_BIT_BUFFER:
+                        elif len(output) > MAX_BIT_BUFFER:
                             # Drop the oldest bits to bound memory on noisy input.
-                            del self.output[:-MAX_BIT_BUFFER]
-                self.sp = 1
+                            del output[:-MAX_BIT_BUFFER]
+                sp = 1
             else:
-                self.sp += 1
-            self.last = cyc
+                sp += 1
+            last = neg
+
+        self.last = last
+        self.toggle = toggle
+        self.sp = sp
+        self.sync_reg = sync_reg
         return results
 
 
@@ -251,29 +296,20 @@ def _show_error(title: str, detail: str) -> None:
         print(f"{title}: {detail}")
 
 
-def _ui(fn) -> None:
-    """Schedule a UI update on the Tk main thread.
-
-    Silently ignores the errors raised when the window has already been
-    destroyed, so closing the app mid-transmission does not print a traceback.
-    """
-    try:
-        frame.after(0, fn)
-    except (RuntimeError, tk.TclError):
-        pass
-
-
 def print_tc(freq: int) -> None:
-    """Free-running MTC transmitter.
+    """Free-running MTC transmitter. Runs on its own thread.
 
     Emits MIDI quarter-frame messages at the spec rate of four per frame
     (eight messages span two frames, encoding one complete timecode). The
     cadence is locked to a monotonic clock so it does not drift, and the
     internal counter is continually re-synced to the latest decoded LTC value.
-    All Tkinter access is dispatched to the main thread via _ui(); this thread
-    never reads or writes Tk objects directly, hence ``freq`` is passed in
-    rather than read from the frame-rate selector here.
+
+    This thread never touches Tk. It publishes what it wants displayed into
+    _status_state / _display_tc, which ui_refresh() picks up on the main
+    thread; ``freq`` is likewise passed in rather than read from the selector.
     """
+    global _status_state, _display_tc
+
     if freq == 0:
         return
     qf_interval = 1.0 / (4 * freq)
@@ -304,15 +340,15 @@ def print_tc(freq: int) -> None:
 
             if no_signal:
                 qf_values = None
-                _ui(lambda: status_square.configure(bg='grey'))
-                _ui(lambda: label_timecode.config(text="Timecode : --:--:--:--"))
+                _status_state = 'grey'
+                _display_tc = '--:--:--:--'
             elif compare_timestamps(tcp, current_jam, freq) < 1.5:
                 qf_values = mtc_quarter_frame_values(h, m, s, f, freq)
-                _ui(lambda t=tcp: label_timecode.config(text=f"Timecode : {t}"))
-                _ui(lambda: status_square.configure(bg='green'))
+                _status_state = 'green'
+                _display_tc = tcp
             else:
                 qf_values = None
-                _ui(lambda: status_square.configure(bg='orange'))
+                _status_state = 'orange'
 
         if qf_values is not None:
             _send_quarter_frame(*qf_values[qf_index])
@@ -346,23 +382,62 @@ def _update_volume_bar(db: float) -> None:
     volume_canvas.create_rectangle(0, 0, bar_px, 16, fill=color, outline='', tags='bar')
 
 
-def loop_decode_ltc(stream) -> None:
-    global jam, drop_frame_mode, _last_frame_time
+def capture_loop(stream) -> None:
+    """Audio capture and LTC decoding. Runs on its own thread.
+
+    stream.read() blocks until a full chunk is available. Doing that on the Tk
+    main thread (as this once did) froze the GUI for the duration of every
+    read, which is what made the interface feel sluggish. Here it blocks a
+    worker instead, and reads back-to-back with no gap so the driver buffer
+    cannot build up a backlog.
+    """
+    global jam, drop_frame_mode, _last_frame_time, _volume_db
+
+    while not _stop_event.is_set():
+        try:
+            data = stream.read(CHUNK, exception_on_overflow=False)
+        except Exception:
+            break
+
+        _volume_db = get_volume_db(data)
+
+        results = _decoder.feed(data)
+        if results:
+            with _tc_lock:
+                jam = results[-1]
+                drop_frame_mode = _decoder.drop_frame
+            _last_frame_time = time.monotonic()
+
+
+def ui_refresh() -> None:
+    """Repaint the UI from shared state. Runs on the Tk main thread only.
+
+    Every widget update in the app funnels through here, so the worker threads
+    never touch Tk and never schedule work onto it. Widgets are only touched
+    when their value actually changed, which keeps the redraw cost near zero
+    while idle.
+    """
+    global _shown_status, _shown_tc, _shown_volume
+
     if not enable_listening.get():
         return
-    try:
-        data = stream.read(CHUNK, exception_on_overflow=False)
-    except Exception:
-        return
-    _update_volume_bar(get_volume_db(data))
-    results = _decoder.feed(data)
-    if results:
-        with _tc_lock:
-            jam = results[-1]
-            drop_frame_mode = _decoder.drop_frame
-        _last_frame_time = time.monotonic()
-    if enable_listening.get():
-        frame.after(10, lambda: loop_decode_ltc(stream))
+
+    if _status_state != _shown_status:
+        status_square.configure(bg=_status_state)
+        _shown_status = _status_state
+
+    if _display_tc != _shown_tc:
+        label_timecode.config(text=f"Timecode : {_display_tc}")
+        _shown_tc = _display_tc
+
+    # Redraw the meter only on a visible change (1 dB granularity).
+    db = _volume_db
+    quantised = None if db == float('-inf') else round(db)
+    if quantised != _shown_volume:
+        _update_volume_bar(db)
+        _shown_volume = quantised
+
+    frame.after(UI_REFRESH_MS, ui_refresh)
 
 
 def _close_audio() -> None:
@@ -394,13 +469,15 @@ def _close_midi() -> None:
 
 
 def _stop_transmitter() -> None:
-    """Signal the MTC thread to stop and wait briefly for it to exit, so a
-    rapid disable/enable cycle can never leave two threads transmitting."""
-    global _tc_thread
+    """Signal both worker threads to stop and wait briefly for them to exit,
+    so a rapid disable/enable cycle can never leave two sets running."""
+    global _tc_thread, _audio_thread
     _stop_event.set()
-    if _tc_thread is not None and _tc_thread.is_alive():
-        _tc_thread.join(timeout=1.0)
+    for t in (_tc_thread, _audio_thread):
+        if t is not None and t.is_alive():
+            t.join(timeout=1.0)
     _tc_thread = None
+    _audio_thread = None
 
 
 def init_ltc_listener() -> bool:
@@ -410,12 +487,19 @@ def init_ltc_listener() -> bool:
     explanatory dialog is shown, and False is returned so the caller can put
     the UI back into its stopped state instead of leaving it half-enabled.
     """
-    global _audio_instance, _audio_stream, _midi_port, _last_frame_time, _tc_thread
+    global _audio_instance, _audio_stream, _midi_port, _last_frame_time
+    global _tc_thread, _audio_thread
+    global _volume_db, _status_state, _display_tc
+    global _shown_status, _shown_tc, _shown_volume
 
     _stop_transmitter()
     _close_audio()
     _close_midi()
     _last_frame_time = 0.0
+    _volume_db = float('-inf')
+    _status_state = 'grey'
+    _display_tc = '--:--:--:--'
+    _shown_status = _shown_tc = _shown_volume = None
 
     freq = str_frequency_to_int(selected_frequency.get())
     if freq:
@@ -462,7 +546,11 @@ def init_ltc_listener() -> bool:
     _tc_thread = threading.Thread(target=print_tc, args=(freq,), daemon=True)
     _tc_thread.start()
 
-    loop_decode_ltc(_audio_stream)
+    # Capture runs on its own thread so its blocking reads never stall the GUI.
+    _audio_thread = threading.Thread(target=capture_loop, args=(_audio_stream,), daemon=True)
+    _audio_thread.start()
+
+    ui_refresh()
     return True
 
 

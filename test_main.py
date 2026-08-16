@@ -6,6 +6,7 @@ pure, hardware-independent functions are exercised here; the GUI bootstrap in
 main() is never invoked.
 """
 
+import struct
 import sys
 import unittest
 from unittest import mock
@@ -26,9 +27,11 @@ def encode_field(value: int, nbits: int) -> str:
     return ''.join(str((value >> i) & 1) for i in range(nbits))
 
 
-def build_frame(hh: int, mm: int, ss: int, ff: int) -> str:
+def build_frame(hh: int, mm: int, ss: int, ff: int, drop_frame: bool = False) -> str:
     """Construct an 80-bit LTC frame string for the given timecode."""
     bits = ['0'] * 80
+    if drop_frame:
+        bits[10] = '1'
 
     def place(s: str, start: int) -> None:
         for k, ch in enumerate(s):
@@ -44,6 +47,31 @@ def build_frame(hh: int, mm: int, ss: int, ff: int) -> str:
     place(encode_field(hh // 10, 2), 56)  # hour tens
     place(main.SYNC_WORD, 64)             # sync word
     return ''.join(bits)
+
+
+def build_ltc_audio(frames, samples_per_bit: int = 20, amplitude: int = 12000) -> bytes:
+    """Render LTC frame bit-strings as biphase-mark-coded 16-bit mono audio.
+
+    Biphase mark: every bit period begins with a polarity transition, and a
+    '1' has an extra transition at its midpoint. At 48 kHz / 30 fps a bit
+    period is 20 samples, which is what the decoder's thresholds expect.
+    """
+    samples = []
+    polarity = 1
+    # Lead-in, so the decoder has an established polarity to transition from.
+    samples.extend([amplitude] * samples_per_bit)
+    for frame in frames:
+        for bit in frame:
+            if bit == '0':
+                polarity = -polarity
+                samples.extend([amplitude * polarity] * samples_per_bit)
+            else:
+                half = samples_per_bit // 2
+                polarity = -polarity
+                samples.extend([amplitude * polarity] * half)
+                polarity = -polarity
+                samples.extend([amplitude * polarity] * (samples_per_bit - half))
+    return struct.pack(f'<{len(samples)}h', *samples)
 
 
 class TestBinToInt(unittest.TestCase):
@@ -221,6 +249,37 @@ class TestLTCDecoder(unittest.TestCase):
     def test_silence_yields_nothing(self):
         dec = main.LTCDecoder()
         self.assertEqual(dec.feed(b'\x00\x00' * 100), [])
+
+    def test_decodes_a_synthesised_frame(self):
+        # End-to-end: encode a timecode as biphase-mark audio and decode it.
+        dec = main.LTCDecoder(rate=48000, fps=30)
+        audio = build_ltc_audio([build_frame(1, 23, 45, 12)])
+        self.assertIn('01:23:45:12', dec.feed(audio))
+
+    def test_frame_split_across_chunks_still_decodes(self):
+        # The whole point of the decoder being stateful: a frame straddling a
+        # chunk boundary must still come out.
+        dec = main.LTCDecoder(rate=48000, fps=30)
+        audio = build_ltc_audio([build_frame(2, 0, 0, 5)])
+        results = []
+        for i in range(0, len(audio), 512 * 2):
+            results.extend(dec.feed(audio[i:i + 512 * 2]))
+        self.assertIn('02:00:00:05', results)
+
+    def test_consecutive_frames_all_decode(self):
+        dec = main.LTCDecoder(rate=48000, fps=30)
+        frames = [build_frame(0, 0, 0, n) for n in range(4)]
+        results = dec.feed(build_ltc_audio(frames))
+        self.assertEqual(
+            results,
+            ['00:00:00:00', '00:00:00:01', '00:00:00:02', '00:00:00:03'],
+        )
+
+    def test_drop_frame_flag_is_picked_up(self):
+        dec = main.LTCDecoder(rate=48000, fps=30)
+        self.assertFalse(dec.drop_frame)
+        dec.feed(build_ltc_audio([build_frame(0, 0, 0, 1, drop_frame=True)]))
+        self.assertTrue(dec.drop_frame)
 
     def test_buffer_is_bounded_on_noise(self):
         # Alternating samples create constant polarity flips (no valid frame);
