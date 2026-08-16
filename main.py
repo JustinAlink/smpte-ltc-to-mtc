@@ -64,6 +64,7 @@ _audio_instance: 'pyaudio.PyAudio | None' = None
 _audio_stream = None
 _midi_port = None
 _stop_event = threading.Event()
+_tc_thread: 'threading.Thread | None' = None
 _last_frame_time: float = 0.0
 
 # Maps microphone display name -> PyAudio device index. Populated by main().
@@ -241,17 +242,38 @@ def _send_quarter_frame(frame_type: int, frame_value: int) -> None:
         print(f"MIDI send error: {e}")
 
 
-def print_tc() -> None:
+def _show_error(title: str, detail: str) -> None:
+    """Report a runtime problem in a dialog, falling back to the console."""
+    try:
+        import tkinter.messagebox as mb
+        mb.showerror(f"SMPTE LTC to MTC — {title}", detail)
+    except Exception:
+        print(f"{title}: {detail}")
+
+
+def _ui(fn) -> None:
+    """Schedule a UI update on the Tk main thread.
+
+    Silently ignores the errors raised when the window has already been
+    destroyed, so closing the app mid-transmission does not print a traceback.
+    """
+    try:
+        frame.after(0, fn)
+    except (RuntimeError, tk.TclError):
+        pass
+
+
+def print_tc(freq: int) -> None:
     """Free-running MTC transmitter.
 
     Emits MIDI quarter-frame messages at the spec rate of four per frame
     (eight messages span two frames, encoding one complete timecode). The
     cadence is locked to a monotonic clock so it does not drift, and the
     internal counter is continually re-synced to the latest decoded LTC value.
-    All Tkinter widget updates are dispatched to the main thread via
-    frame.after() so this thread never touches the UI directly.
+    All Tkinter access is dispatched to the main thread via _ui(); this thread
+    never reads or writes Tk objects directly, hence ``freq`` is passed in
+    rather than read from the frame-rate selector here.
     """
-    freq = str_frequency_to_int(selected_frequency.get())
     if freq == 0:
         return
     qf_interval = 1.0 / (4 * freq)
@@ -282,15 +304,15 @@ def print_tc() -> None:
 
             if no_signal:
                 qf_values = None
-                frame.after(0, lambda: status_square.configure(bg='grey'))
+                _ui(lambda: status_square.configure(bg='grey'))
+                _ui(lambda: label_timecode.config(text="Timecode : --:--:--:--"))
             elif compare_timestamps(tcp, current_jam, freq) < 1.5:
                 qf_values = mtc_quarter_frame_values(h, m, s, f, freq)
-                _tcp = tcp
-                frame.after(0, lambda t=_tcp: label_timecode.config(text=f"Timecode : {t}"))
-                frame.after(0, lambda: status_square.configure(bg='green'))
+                _ui(lambda t=tcp: label_timecode.config(text=f"Timecode : {t}"))
+                _ui(lambda: status_square.configure(bg='green'))
             else:
                 qf_values = None
-                frame.after(0, lambda: status_square.configure(bg='orange'))
+                _ui(lambda: status_square.configure(bg='orange'))
 
         if qf_values is not None:
             _send_quarter_frame(*qf_values[qf_index])
@@ -371,12 +393,28 @@ def _close_midi() -> None:
         _midi_port = None
 
 
-def init_ltc_listener() -> None:
-    global _audio_instance, _audio_stream, _midi_port, _last_frame_time
+def _stop_transmitter() -> None:
+    """Signal the MTC thread to stop and wait briefly for it to exit, so a
+    rapid disable/enable cycle can never leave two threads transmitting."""
+    global _tc_thread
+    _stop_event.set()
+    if _tc_thread is not None and _tc_thread.is_alive():
+        _tc_thread.join(timeout=1.0)
+    _tc_thread = None
 
+
+def init_ltc_listener() -> bool:
+    """Open the audio and MIDI devices and start transmitting.
+
+    Returns True on success. On failure the devices are closed again, an
+    explanatory dialog is shown, and False is returned so the caller can put
+    the UI back into its stopped state instead of leaving it half-enabled.
+    """
+    global _audio_instance, _audio_stream, _midi_port, _last_frame_time, _tc_thread
+
+    _stop_transmitter()
     _close_audio()
     _close_midi()
-    _stop_event.clear()
     _last_frame_time = 0.0
 
     freq = str_frequency_to_int(selected_frequency.get())
@@ -384,30 +422,48 @@ def init_ltc_listener() -> None:
         _decoder.configure(RATE, freq)
     _decoder.reset()
 
+    # Resolve the selected microphone name back to its PyAudio device index.
+    # None falls back to the system default input device.
+    device_index = microphone_indices.get(selected_microphone.get())
+
+    # Open the audio input first: it is the failure most likely to happen on
+    # an arbitrary machine (no input device, device in use, format refused).
+    try:
+        _audio_instance = pyaudio.PyAudio()
+        _audio_stream = _audio_instance.open(
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
+            input=True,
+            frames_per_buffer=CHUNK,
+            input_device_index=device_index,
+        )
+    except Exception as e:
+        _close_audio()
+        _show_error(
+            "Could not open the audio input",
+            f"{e}\n\nCheck that the selected microphone is connected and not "
+            f"already in use by another program, then try again.",
+        )
+        return False
+
     midi_port_name = selected_midi.get()
     if midi_port_name:
         try:
             _midi_port = mido.open_output(midi_port_name)
         except Exception as e:
-            print(f"Failed to open MIDI port: {e}")
+            _show_error(
+                "Could not open the MIDI output",
+                f"{e}\n\nLTC will still be decoded and displayed, but no MTC "
+                f"will be sent. Pick a different MIDI output and try again.",
+            )
 
-    # Resolve the selected microphone name back to its PyAudio device index.
-    # None falls back to the system default input device.
-    device_index = microphone_indices.get(selected_microphone.get())
+    _stop_event.clear()
+    _tc_thread = threading.Thread(target=print_tc, args=(freq,), daemon=True)
+    _tc_thread.start()
 
-    _audio_instance = pyaudio.PyAudio()
-    t = threading.Thread(target=print_tc, daemon=True)
-    t.start()
-
-    _audio_stream = _audio_instance.open(
-        format=FORMAT,
-        channels=CHANNELS,
-        rate=RATE,
-        input=True,
-        frames_per_buffer=CHUNK,
-        input_device_index=device_index,
-    )
     loop_decode_ltc(_audio_stream)
+    return True
 
 
 def decimal_to_hex_pair(decimal_value: int) -> list[int]:
@@ -425,38 +481,72 @@ def compare_timestamps(timestamp1: str, timestamp2: str, fps: int = 30) -> float
 
 
 def get_default_input_device_name() -> str:
-    p = pyaudio.PyAudio()
-    default_index = p.get_default_input_device_info()['index']
-    default_name = p.get_device_info_by_index(default_index)['name']
-    p.terminate()
-    return default_name
+    """Name of the system default input device, or '' if there is none.
+
+    PyAudio raises when the machine has no default input device at all, which
+    must not be allowed to abort startup.
+    """
+    p = None
+    try:
+        p = pyaudio.PyAudio()
+        default_index = p.get_default_input_device_info()['index']
+        return p.get_device_info_by_index(default_index)['name']
+    except Exception:
+        return ''
+    finally:
+        if p is not None:
+            p.terminate()
+
+
+def disambiguate_names(pairs: 'list[tuple[str, int]]') -> 'list[tuple[str, int]]':
+    """Make device display names unique.
+
+    Windows commonly reports several devices with an identical name; without
+    this the name -> index map would collapse them and every duplicate past
+    the first would be unselectable.
+    """
+    counts: 'dict[str, int]' = {}
+    out = []
+    for name, index in pairs:
+        counts[name] = counts.get(name, 0) + 1
+        out.append((name if counts[name] == 1 else f"{name} ({counts[name]})", index))
+    return out
 
 
 def get_available_microphones() -> 'list[tuple[str, int]]':
-    """Return (name, device_index) pairs for every input-capable device,
-    with the system default device first."""
-    p = pyaudio.PyAudio()
-    info = p.get_host_api_info_by_index(0)
-    num_devices = info.get('deviceCount')
-
+    """Return (name, device_index) pairs for every input-capable device, with
+    the system default device first. Returns [] if enumeration fails."""
+    p = None
     microphones = []
-    for i in range(num_devices):
-        device_info = p.get_device_info_by_index(i)
-        if device_info.get('maxInputChannels') > 0:
-            microphones.append((device_info['name'], i))
-    p.terminate()
+    try:
+        p = pyaudio.PyAudio()
+        info = p.get_host_api_info_by_index(0)
+        num_devices = info.get('deviceCount') or 0
+        for i in range(num_devices):
+            device_info = p.get_device_info_by_index(i)
+            if device_info.get('maxInputChannels') > 0:
+                microphones.append((device_info['name'], i))
+    except Exception:
+        return []
+    finally:
+        if p is not None:
+            p.terminate()
 
     default_name = get_default_input_device_name()
-    for idx, (name, _) in enumerate(microphones):
-        if name == default_name:
-            microphones.insert(0, microphones.pop(idx))
-            break
+    if default_name:
+        for idx, (name, _) in enumerate(microphones):
+            if name == default_name:
+                microphones.insert(0, microphones.pop(idx))
+                break
 
-    return microphones
+    return disambiguate_names(microphones)
 
 
 def get_available_midis() -> list[str]:
-    return list(mido.get_output_names())
+    try:
+        return list(mido.get_output_names())
+    except Exception:
+        return []
 
 
 def str_frequency_to_int(s: str) -> int:
@@ -470,38 +560,73 @@ def str_frequency_to_int(s: str) -> int:
         return 0
 
 
-def get_volume_db(data: bytes) -> float:
+def get_volume_db(data: bytes, stride: int = 8) -> float:
+    """RMS level of a 16-bit mono buffer, in dB relative to 1 LSB.
+
+    Only every ``stride``-th sample is inspected: this drives a coarse level
+    meter, so full precision is not needed and sampling keeps the cost off the
+    audio path.
+    """
     n = len(data) // 2
     if n == 0:
         return float('-inf')
-    samples = struct.unpack_from(f'<{n}h', data)
-    mean_sq = sum(s * s for s in samples) / n
+    samples = struct.unpack_from(f'<{n}h', data)[::stride]
+    count = len(samples)
+    if count == 0:
+        return float('-inf')
+    mean_sq = sum(s * s for s in samples) / count
     if mean_sq == 0:
         return float('-inf')
     return 20 * math.log10(math.sqrt(mean_sq))
+
+
+def _set_ui_running() -> None:
+    # Grey until the first LTC frame arrives.
+    status_square.configure(bg='grey')
+    toggle_button.configure(text="Disable listener")
+    label_microphone.configure(state="disabled")
+    label_frequency.configure(state="disabled")
+    label_midi.configure(state="disabled")
+
+
+def _set_ui_stopped() -> None:
+    status_square.configure(bg='red')
+    volume_canvas.delete('bar')
+    label_timecode.config(text="Timecode")
+    toggle_button.configure(text="Enable listener")
+    label_microphone.configure(state="normal")
+    label_frequency.configure(state="normal")
+    label_midi.configure(state="normal")
+
+
+def stop_listening() -> None:
+    """Tear down the transmitter and both devices. Safe to call when idle."""
+    _stop_transmitter()
+    _close_audio()
+    _close_midi()
 
 
 def toggle_read_ltc() -> None:
     enable_listening.set(not enable_listening.get())
 
     if enable_listening.get():
-        # Grey until the first LTC frame arrives.
-        status_square.configure(bg='grey')
-        toggle_button.configure(text="Disable listener")
-        label_microphone.configure(state="disabled")
-        label_frequency.configure(state="disabled")
-        label_midi.configure(state="disabled")
-        init_ltc_listener()
+        _set_ui_running()
+        if not init_ltc_listener():
+            # Startup failed; revert to the stopped state rather than leaving
+            # the button reading "Disable listener" over a dead listener.
+            enable_listening.set(False)
+            _set_ui_stopped()
     else:
-        _stop_event.set()
-        status_square.configure(bg='red')
-        volume_canvas.delete('bar')
-        toggle_button.configure(text="Enable listener")
-        label_microphone.configure(state="normal")
-        label_frequency.configure(state="normal")
-        label_midi.configure(state="normal")
-        _close_audio()
-        _close_midi()
+        stop_listening()
+        _set_ui_stopped()
+
+
+def on_close() -> None:
+    """Shut down cleanly when the window is closed, so the transmitter thread
+    never touches Tk objects after the root has been destroyed."""
+    enable_listening.set(False)
+    stop_listening()
+    frame.destroy()
 
 
 def main() -> None:
@@ -520,7 +645,7 @@ def main() -> None:
 
     # Create main frame
     frame = tk.Tk()
-    frame.title("SMPTE LTC to MTC 1.1.0")
+    frame.title("SMPTE LTC to MTC 1.2.0")
     frame.geometry("300x480")
     frame.resizable(width=False, height=False)
 
@@ -568,6 +693,17 @@ def main() -> None:
         row=10, column=0, columnspan=12, padx=20, sticky="w")
     volume_canvas = tk.Canvas(frame, height=16, bg='#2b2b2b', highlightthickness=0)
     volume_canvas.grid(row=11, column=0, columnspan=12, padx=20, pady=(0, 8), sticky="ew")
+
+    # Shut the transmitter down before the widgets go away.
+    frame.protocol("WM_DELETE_WINDOW", on_close)
+
+    if not mic_list:
+        toggle_button.configure(state="disabled")
+        frame.after(200, lambda: _show_error(
+            "No audio input found",
+            "No microphone or line input was detected, so LTC cannot be "
+            "received.\n\nConnect an audio input and restart the application.",
+        ))
 
     frame.mainloop()
 

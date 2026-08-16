@@ -170,8 +170,43 @@ class TestGetVolumeDb(unittest.TestCase):
         self.assertAlmostEqual(main.get_volume_db(data), 60.0, places=5)
 
     def test_no_audioop_dependency(self):
-        import importlib
         self.assertNotIn('audioop', dir(main))
+
+    def test_stride_does_not_change_constant_signal(self):
+        # Subsampling the meter must not shift the reading for a steady tone.
+        data = b'\xe8\x03' * 2048
+        self.assertAlmostEqual(
+            main.get_volume_db(data, stride=1),
+            main.get_volume_db(data, stride=8),
+            places=9,
+        )
+
+    def test_buffer_shorter_than_stride_still_reads(self):
+        # A single sample must not fall through the subsampling and read -inf.
+        self.assertAlmostEqual(main.get_volume_db(b'\xe8\x03', stride=8), 60.0, places=5)
+
+
+class TestDisambiguateNames(unittest.TestCase):
+    def test_unique_names_unchanged(self):
+        pairs = [('Mic A', 0), ('Mic B', 1)]
+        self.assertEqual(main.disambiguate_names(pairs), pairs)
+
+    def test_duplicates_get_suffixed(self):
+        # Windows commonly reports several identically-named devices.
+        pairs = [('Microphone', 0), ('Microphone', 3), ('Microphone', 7)]
+        self.assertEqual(
+            main.disambiguate_names(pairs),
+            [('Microphone', 0), ('Microphone (2)', 3), ('Microphone (3)', 7)],
+        )
+
+    def test_all_indices_survive_the_name_map(self):
+        # The point of the suffixing: every device stays reachable.
+        pairs = [('Mic', 0), ('Mic', 1), ('Other', 2)]
+        mapping = {name: idx for name, idx in main.disambiguate_names(pairs)}
+        self.assertEqual(sorted(mapping.values()), [0, 1, 2])
+
+    def test_empty(self):
+        self.assertEqual(main.disambiguate_names([]), [])
 
 
 class TestLTCDecoder(unittest.TestCase):
