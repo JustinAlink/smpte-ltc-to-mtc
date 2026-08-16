@@ -192,10 +192,28 @@ class TestGetVolumeDb(unittest.TestCase):
     def test_empty_returns_neg_inf(self):
         self.assertEqual(main.get_volume_db(b''), float('-inf'))
 
-    def test_known_signal(self):
-        # 1000 LSB 16-bit samples: RMS = 1000, dB = 20*log10(1000) = 60.0
+    def test_known_signal_is_dbfs(self):
+        # RMS 1000 of a 32768 full scale => 20*log10(1000/32768) = -30.31 dBFS.
+        # The old code returned +60 here, which pinned the meter at maximum.
         data = b'\xe8\x03' * 200  # 0x03E8 = 1000 in little-endian s16
-        self.assertAlmostEqual(main.get_volume_db(data), 60.0, places=5)
+        self.assertAlmostEqual(main.get_volume_db(data), -30.3089987, places=5)
+
+    def test_full_scale_is_zero_dbfs(self):
+        data = struct.pack('<200h', *([32767] * 200))
+        self.assertAlmostEqual(main.get_volume_db(data), 0.0, places=3)
+
+    def test_half_scale_is_about_minus_six(self):
+        data = struct.pack('<200h', *([16384] * 200))
+        self.assertAlmostEqual(main.get_volume_db(data), -6.0206, places=3)
+
+    def test_level_is_monotonic(self):
+        # The meter must actually move with the signal.
+        levels = [
+            main.get_volume_db(struct.pack('<200h', *([amp] * 200)))
+            for amp in (100, 1000, 8000, 32767)
+        ]
+        self.assertEqual(levels, sorted(levels))
+        self.assertTrue(all(db <= 0.0 for db in levels), levels)
 
     def test_no_audioop_dependency(self):
         self.assertNotIn('audioop', dir(main))
@@ -211,7 +229,37 @@ class TestGetVolumeDb(unittest.TestCase):
 
     def test_buffer_shorter_than_stride_still_reads(self):
         # A single sample must not fall through the subsampling and read -inf.
-        self.assertAlmostEqual(main.get_volume_db(b'\xe8\x03', stride=8), 60.0, places=5)
+        self.assertAlmostEqual(
+            main.get_volume_db(b'\xe8\x03', stride=8), -30.3089987, places=5)
+
+
+class TestMeterMapping(unittest.TestCase):
+    def test_silence_and_floor_are_empty(self):
+        self.assertEqual(main.meter_fraction(float('-inf')), 0.0)
+        self.assertEqual(main.meter_fraction(-60.0), 0.0)
+        self.assertEqual(main.meter_fraction(-99.0), 0.0)
+
+    def test_full_scale_fills_the_bar(self):
+        self.assertEqual(main.meter_fraction(0.0), 1.0)
+
+    def test_midpoint(self):
+        self.assertAlmostEqual(main.meter_fraction(-30.0), 0.5)
+
+    def test_never_exceeds_one(self):
+        # A level above full scale must clamp, not overflow the canvas.
+        self.assertEqual(main.meter_fraction(12.0), 1.0)
+
+    def test_typical_ltc_level_is_mid_bar_and_green(self):
+        # A healthy LTC feed sits well below clipping and should read green.
+        db = main.get_volume_db(struct.pack('<200h', *([6000] * 200)))
+        self.assertTrue(-20 < db < -10, db)
+        self.assertEqual(main.meter_color(db), '#44cc44')
+        self.assertTrue(0.6 < main.meter_fraction(db) < 0.9, main.meter_fraction(db))
+
+    def test_colors_by_zone(self):
+        self.assertEqual(main.meter_color(-1.0), '#ff4444')    # near clipping
+        self.assertEqual(main.meter_color(-6.0), '#ffcc00')    # hot
+        self.assertEqual(main.meter_color(-30.0), '#44cc44')   # healthy
 
 
 class TestDisambiguateNames(unittest.TestCase):

@@ -52,6 +52,10 @@ SYNC_INT = int(SYNC_WORD, 2)
 SYNC_MASK = (1 << len(SYNC_WORD)) - 1
 # How often the UI redraws itself from shared state, in milliseconds.
 UI_REFRESH_MS = 50
+# Peak magnitude of a 16-bit sample, used to express levels as dBFS.
+FULL_SCALE = 32768.0
+# Quietest level the meter shows; below this it reads as no signal.
+METER_FLOOR_DB = -60.0
 # Upper bound on accumulated bits between sync words; prevents unbounded
 # growth when the input is noise. Comfortably larger than one 80-bit frame.
 MAX_BIT_BUFFER = 200
@@ -368,18 +372,42 @@ def print_tc(freq: int) -> None:
             next_t = time.monotonic()
 
 
+def meter_fraction(db: float, floor_db: float = METER_FLOOR_DB) -> float:
+    """Map a dBFS level onto 0..1 across the meter's range."""
+    if db == float('-inf') or db <= floor_db:
+        return 0.0
+    return min(1.0, (db - floor_db) / -floor_db)
+
+
+def meter_color(db: float) -> str:
+    """Green while there is comfortable headroom, amber when hot, red near
+    full scale."""
+    if db > -3.0:
+        return '#ff4444'
+    if db > -12.0:
+        return '#ffcc00'
+    return '#44cc44'
+
+
 def _update_volume_bar(db: float) -> None:
-    """Redraw the volume meter canvas. Called from the main thread only."""
+    """Redraw the level meter and its readout. Main thread only."""
     volume_canvas.delete('bar')
+
+    if db == float('-inf'):
+        label_volume.config(text="Input level:  --")
+    else:
+        label_volume.config(text=f"Input level:  {db:.0f} dBFS")
+
     w = volume_canvas.winfo_width()
     if w < 2:
         return
-    if db <= -60.0 or db == float('-inf'):
+    frac = meter_fraction(db)
+    if frac <= 0.0:
         return
-    frac = max(0.0, min(1.0, (db - (-60.0)) / 60.0))
-    bar_px = max(1, int(w * frac))
-    color = '#ff4444' if db > -3 else '#ffcc00' if db > -12 else '#44cc44'
-    volume_canvas.create_rectangle(0, 0, bar_px, 16, fill=color, outline='', tags='bar')
+    volume_canvas.create_rectangle(
+        0, 0, max(1, int(w * frac)), 16,
+        fill=meter_color(db), outline='', tags='bar',
+    )
 
 
 def capture_loop(stream) -> None:
@@ -649,7 +677,12 @@ def str_frequency_to_int(s: str) -> int:
 
 
 def get_volume_db(data: bytes, stride: int = 8) -> float:
-    """RMS level of a 16-bit mono buffer, in dB relative to 1 LSB.
+    """RMS level of a 16-bit mono buffer in dBFS: 0 dB is full scale, and
+    quieter signals are negative.
+
+    The level must be normalised against full scale rather than reported in
+    raw sample units, otherwise every real signal lands in the +70..+90 range
+    and pins the meter at maximum.
 
     Only every ``stride``-th sample is inspected: this drives a coarse level
     meter, so full precision is not needed and sampling keeps the cost off the
@@ -665,7 +698,7 @@ def get_volume_db(data: bytes, stride: int = 8) -> float:
     mean_sq = sum(s * s for s in samples) / count
     if mean_sq == 0:
         return float('-inf')
-    return 20 * math.log10(math.sqrt(mean_sq))
+    return 20 * math.log10(math.sqrt(mean_sq) / FULL_SCALE)
 
 
 def _set_ui_running() -> None:
@@ -680,6 +713,7 @@ def _set_ui_running() -> None:
 def _set_ui_stopped() -> None:
     status_square.configure(bg='red')
     volume_canvas.delete('bar')
+    label_volume.config(text="Input level:  --")
     label_timecode.config(text="Timecode")
     toggle_button.configure(text="Enable listener")
     label_microphone.configure(state="normal")
@@ -722,7 +756,7 @@ def main() -> None:
     global frame, selected_microphone, selected_frequency, selected_midi
     global enable_listening, status_square
     global label_microphone, label_frequency, label_midi
-    global toggle_button, label_timecode, volume_canvas
+    global toggle_button, label_timecode, volume_canvas, label_volume
 
     # Defines values from lists
     mic_list = get_available_microphones()
@@ -776,9 +810,9 @@ def main() -> None:
     label_timecode = tk.Label(frame, text="Timecode", font=("Helvetica", 10, "bold"))
     label_timecode.grid(row=9, column=4, pady=10, sticky="n")
 
-    # Input level label + volume meter canvas
-    tk.Label(frame, text="Input Level", font=("Helvetica", 9)).grid(
-        row=10, column=0, columnspan=12, padx=20, sticky="w")
+    # Input level readout + meter canvas
+    label_volume = tk.Label(frame, text="Input level:  --", font=("Helvetica", 9))
+    label_volume.grid(row=10, column=0, columnspan=12, padx=20, sticky="w")
     volume_canvas = tk.Canvas(frame, height=16, bg='#2b2b2b', highlightthickness=0)
     volume_canvas.grid(row=11, column=0, columnspan=12, padx=20, pady=(0, 8), sticky="ew")
 

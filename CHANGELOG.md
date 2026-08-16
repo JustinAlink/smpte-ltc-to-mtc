@@ -31,6 +31,27 @@ a machine other than the developer's.
 - The timecode readout now shows `--:--:--:--` when there is no signal instead
   of freezing on the last value it saw, and clears when you stop.
 
+### Fixed — responsiveness
+
+- **The window is no longer sluggish.** Audio capture was running on the GUI
+  thread, and each read blocked it for ~43 ms at a time, leaving the interface
+  frozen roughly 81% of the time. Capture now runs on its own thread and the
+  GUI stays responsive. The gap between reads is gone too, so audio no longer
+  backs up in the driver buffer.
+- Timecode is picked up roughly four times sooner, from reading the input in
+  smaller pieces (now viable with capture off the GUI thread).
+
+### Fixed — input level meter
+
+- **The meter was always a full red bar.** Levels were being reported relative
+  to one sample step instead of to full scale, so every real signal came out
+  as +34 to +90 instead of a negative dBFS value — permanently past the
+  clipping threshold and permanently pinned at maximum width. It now reads in
+  dBFS and moves with the signal: green with headroom, amber when hot, red
+  near clipping, empty on silence.
+- A numeric dBFS readout sits above the bar, so it is obvious at a glance
+  whether audio is arriving at all.
+
 ### Changed
 
 - The input level meter is cheaper to compute and no longer does work
